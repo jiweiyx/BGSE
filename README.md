@@ -77,8 +77,9 @@ own width.
 | 1 | Linear | `y = 2x + 1` | `MSE ≤ 1e-2` (error ≈ 0.1) |
 | 2 | Multiplicative | `y = x₁·x₂` | `MSE ≤ 1e-3` (error ≈ 0.03) |
 
-Nobody types `hidden_dim`. The router (784 → 32 → 3) dispatches each input to exactly one
-expert; the others are not executed at all.
+Nobody types `hidden_dim`, including for the gate. The router (784 → h → 3) dispatches each
+input to exactly one expert; the others are not executed at all. `h` is searched under a
+misrouting budget, exactly like the experts' widths.
 
 ### Measured widths
 
@@ -93,6 +94,28 @@ The width ratio comes out as **1 : 2 : 19**, matching the task-difficulty orderi
 
 Note: because each expert also has a different ε, this is a **budget → scale** result rather
 than a clean difficulty → scale result — see [§8](#8-honest-limitations).
+
+### The router is searched too
+
+The gate has the same problem the experts had: its hidden width was a number nobody could
+defend. It gets the same procedure, with **misrouting rate** as the budget instead of MSE.
+
+| Component | Hand-set | BGSE | Parameters | Held-out misrouting | Saved |
+|---|---|---|---|---|---|
+| Router | 32 | **2** | 25184 → 1574 | 0.0000 → 0.0000 | −93.8 % |
+
+The budget is ≤ 2 % misrouting on a held-out quarter of the routing pool, and all five seeds
+land on 2 units. Unlike the experts' widths, this one **is** reproducible from scratch — the
+sweep gives 6.8 % misrouting at 1 unit and 0.0 % at 2 units — so the gate is the one component
+whose searched size could have been found by trial and error as well. Deployed routing
+accuracy is 100 % image, 100 % linear, 99.8 % multiplicative: one input in 640 is sent to the
+wrong numeric expert.
+
+The gate is now 2 units wide and 94 % smaller, and that number came out of the search. It is
+far below the hand-set 32 even though the router is the component that separates the two
+numeric formats, which are nearly identical (one non-zero input dimension vs two) — the old
+32 was not buying accuracy: 2 units misroute nothing on the held-out pool and lose one input
+out of 640 in deployment.
 
 ### Three checks worth reading
 
@@ -131,13 +154,14 @@ go beyond 32*, not whether to trim from 32 to 19.
 git clone https://github.com/jiweiyx/BGSE
 cd BGSE
 pip install torch torchvision        # CPU is enough
-python HS-MoE-Demo.py                # ~110 s; MNIST downloads to ./data once
+python HS-MoE-Demo.py                # ~130 s; MNIST downloads to ./data once
 python BGSE-Study.py                 # ~80 s; the five methodological experiments
 ```
 
-`HS-MoE-Demo.py` prints per-seed search traces, the width sweep, a same-conditions
-comparison against the hand-set values, the from-scratch reproducibility check, router
-accuracy, and live dispatch examples for all three modalities.
+`HS-MoE-Demo.py` prints per-seed search traces for the three experts and the router, the
+width sweeps, a same-conditions comparison against the hand-set values, the from-scratch
+reproducibility checks, routing accuracy, and live dispatch examples for all three
+modalities.
 
 `BGSE-Study.py` reproduces the evidence behind §3: the nine-seed control, the
 single-variable task comparison, the repair-timing ablation, and the scoreboard
@@ -156,7 +180,7 @@ Determinism  : fixed seeds throughout; multi-seed by design
 
 | Path | Contents |
 |---|---|
-| `HS-MoE-Demo.py` | The demo in this README: three experts, three budgets, one router |
+| `HS-MoE-Demo.py` | The demo in this README: three experts and a router, each with a searched width |
 | `BGSE-Study.py` | The study behind the rules: nine-seed budget-vs-width control, single-variable task comparison, repair-timing ablation, and the scoreboard comparison |
 | `README.md` | This document |
 
@@ -182,8 +206,12 @@ Determinism  : fixed seeds throughout; multi-seed by design
   budget→scale result, not a clean difficulty→scale result.
 - **The multiplicative expert sits on the boundary** (validation 0.0008 against ε = 1e-3).
   That is a borderline solution; if you need engineering margin, take 4 dims.
-- **Deployed widths are not reproducible from scratch** (§4b). This is a property of the
-  method, not a bug, but it means BGSE must ship as *search + artefact*.
+- **Deployed expert widths are not reproducible from scratch** (§4b). This is a property of
+  the method, not a bug, but it means BGSE must ship as *search + artefact*. The router is
+  the exception: its 2-unit width is reachable from scratch.
+- **Only width is searched** — depth, activation and the number of experts are fixed by hand.
+  The router is a single hidden layer by construction; a deeper gate would need a different
+  mutation operator.
 - **Linearity of cost assumed** — evaluation cost is linear in width, which holds for these
   MLPs and would need rework for attention-based blocks.
 

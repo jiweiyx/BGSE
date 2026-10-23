@@ -16,6 +16,10 @@ smallest hidden width that meets that budget. Nobody types "hidden_dim=4" or
     Expert 0  Image           MNIST digit regression      (784 -> h -> 1)
     Expert 1  Linear          y = 2x + 1                  (1 non-zero input dim)
     Expert 2  Multiplicative  y = x1 * x2                 (2 non-zero input dims)
+    Router    Gate            picks one expert per input   (784 -> h -> 3)
+
+Nothing in that table has a hand-set width: the experts search theirs under a
+precision budget, the router searches its own under a routing-error budget.
 
 Four design rules, taken from the BGSE study:
   1. Lexicographic budget fitness. Feasibility first (MSE <= epsilon), then
@@ -34,12 +38,12 @@ Four design rules, taken from the BGSE study:
 
 What it usually reports
 -----------------------
-Three experts, three independent budgets, no hand-set widths. The search
-returns widths in the ratio 1 : 2 : 19 (linear / multiplicative / image),
-i.e. -75%, -88% and -41% parameters, and the ordering reproduces the
-task-difficulty ordering on its own.
+Three experts and a router, four budgets, no hand-set widths. The experts
+come out at 1 : 2 : 19 units (linear / multiplicative / image), i.e. -75%,
+-88% and -41% parameters; the router comes out at 2 units instead of 32,
+-94% parameters, with zero held-out misrouting.
 
-Runtime: python3 HS-MoE-Demo.py   (CPU only, about 110 s; MNIST is downloaded once)
+Runtime: python3 HS-MoE-Demo.py   (CPU only, about 130 s; MNIST is downloaded once)
 """
 import copy
 import random
@@ -54,9 +58,8 @@ torch.set_num_threads(4)
 
 SEEDS = list(range(5))
 
-# Hand-set widths: the original 08.py used 4 (numeric) and 32 (image).
-# The multiplicative expert is new, so we start it from a common default of 16.
-BASE_DIM = {"num": 4, "mul": 16, "img": 32}
+# Hand-set widths, used only as the starting point of each search.
+BASE_DIM = {"num": 4, "mul": 16, "img": 32, "router": 32}
 
 _GENS = 45
 _POP = 6
@@ -175,12 +178,14 @@ def make_mnist():
 # ==========================================
 # 2. A width-variable expert
 # ==========================================
-class SingleExpert(nn.Module):
-    def __init__(self, hidden_dim):
+class WidthNet(nn.Module):
+    """A two-layer net whose hidden width is its only structural degree of freedom."""
+
+    def __init__(self, hidden_dim, out_dim=1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.layer1 = nn.Linear(784, hidden_dim)
-        self.layer2 = nn.Linear(hidden_dim, 1)
+        self.layer2 = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
         return self.layer2(torch.relu(self.layer1(x)))
@@ -188,6 +193,20 @@ class SingleExpert(nn.Module):
     def get_weight_count(self):
         """Weight-matrix elements only (biases excluded), as in BGSE-Study.py."""
         return self.layer1.weight.numel() + self.layer2.weight.numel()
+
+
+class SingleExpert(WidthNet):
+    """Regression expert: 784 -> hidden -> 1."""
+
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim, out_dim=1)
+
+
+class Router(WidthNet):
+    """Gate: 784 -> hidden -> one logit per expert."""
+
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim, out_dim=3)
 
 
 def mse_of(model, split):
@@ -268,7 +287,7 @@ def mutate(model, feasible, max_dim, min_dim=1, allow_structure=True):
     with torch.no_grad():
         if u < shrink_p and d > min_dim:
             # Shrink: slice the tensor. Surviving channels are bit-identical.
-            m = SingleExpert(d - 1)
+            m = type(model)(d - 1)
             drop = random.randint(0, d - 1)
             keep = [i for i in range(d) if i != drop]
             m.layer1.weight.copy_(model.layer1.weight[keep])
@@ -277,7 +296,7 @@ def mutate(model, feasible, max_dim, min_dim=1, allow_structure=True):
             m.layer2.bias.copy_(model.layer2.bias)
         elif u < shrink_p + grow_p and d < max_dim:
             # Grow: transplant every learned parameter, initialise one channel.
-            m = SingleExpert(d + 1)
+            m = type(model)(d + 1)
             m.layer1.weight[:d].copy_(model.layer1.weight)
             m.layer1.bias[:d].copy_(model.layer1.bias)
             m.layer2.weight[:, :d].copy_(model.layer2.weight)
@@ -340,7 +359,7 @@ def evolve_width(data, seed, gens=_GENS, pop=_POP, allow_structure=True):
     }
 
 
-def pick_champion(runs):
+def pick_champion(runs, value_key="val_mse"):
     """Pick the scale across seeds: median of the feasible champion widths.
 
     Taking the narrowest feasible champion instead would mostly pick the seed
@@ -351,7 +370,7 @@ def pick_champion(runs):
     dims = sorted(r["champion"]["dim"] for r in pool)
     median = dims[len(dims) // 2]
     winner = min([r for r in pool if r["champion"]["dim"] == median],
-                 key=lambda r: r["champion"]["val_mse"])
+                 key=lambda r: r["champion"][value_key])
     return winner["champion"], len(feasible), median
 
 
@@ -375,34 +394,152 @@ def sweep_widths(data, widths, reps=2):
 
 
 # ==========================================
-# 6. Router (trained on a separate pool, scored out of sample)
+# 6. Router: the gate, with its width searched too
 # ==========================================
-def train_router(modalities, epochs=20, lr=0.01, bs=64):
-    """modalities: [(label, data), ...] with 0 = image, 1 = linear, 2 = product.
+def make_router_data(modalities, eps=0.02):
+    """Router training and validation pools, labelled and shuffled.
 
-    The router grew from a single 784->2 layer to 784->32->3: after the
-    multiplicative expert joined, the two numeric modalities have almost
-    identical input formats (one non-zero dim vs two), and a linear router
-    could not separate them (97.8% on the linear expert; x=1.0 was sent to the
-    product expert). A 32-unit hidden layer fixes it.
+    Each modality contributes its routing pool, split 75/25. The router is
+    scored on the held-out 25% and never on the points its experts train on.
+
+    The pools are concatenated by class, so batches are shuffled: drawn in
+    order, each batch would hold a single label and cross-entropy would stall.
     """
-    torch.manual_seed(0)
-    router = nn.Sequential(nn.Linear(784, 32), nn.ReLU(),
-                           nn.Linear(32, len(modalities)))
-    opt = optim.Adam(router.parameters(), lr=lr)
+    train_X, train_y, val_X, val_y = [], [], [], []
+    for label, data in modalities:
+        X = data["route"]
+        k = int(0.75 * X.shape[0])
+        train_X.append(X[:k])
+        train_y.append(torch.full((k,), label, dtype=torch.long))
+        val_X.append(X[k:])
+        val_y.append(torch.full((X.shape[0] - k,), label, dtype=torch.long))
+
+    gen = torch.Generator().manual_seed(3)
+    X_tr, y_tr = torch.cat(train_X), torch.cat(train_y)
+    X_va, y_va = torch.cat(val_X), torch.cat(val_y)
+    perm_tr = torch.randperm(X_tr.shape[0], generator=gen)
+    perm_va = torch.randperm(X_va.shape[0], generator=gen)
+    return {
+        "train": (X_tr[perm_tr], y_tr[perm_tr]),
+        "val": (X_va[perm_va], y_va[perm_va]),
+        "eps": eps,
+        "max_dim": 64,
+        "mother_steps": 500,
+        "mother_lr": 0.01,
+        "refit_steps": 80,
+    }
+
+
+def train_router_width(split, hidden_dim, steps, lr, bs=64, seed=None):
+    """Train a router of a given width from scratch."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    X, y = split
+    model = Router(hidden_dim)
+    opt = optim.Adam(model.parameters(), lr=lr)
     crit = nn.CrossEntropyLoss()
-    feeds = [(label, data.get("route", data["train"][0])) for label, data in modalities]
-    for _ in range(epochs):
-        for label, X in feeds:
-            for s0 in range(0, X.shape[0], bs):
-                chunk = X[s0:s0 + bs]
-                target = torch.full((chunk.shape[0],), label, dtype=torch.long)
-                loss = crit(router(chunk), target)
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-    router.eval()
-    return router
+    n = X.shape[0]
+    bs = min(bs, n)
+    for s in range(steps):
+        i = (s * bs) % max(1, n - bs + 1)
+        loss = crit(model(X[i:i + bs]), y[i:i + bs])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    model.eval()
+    return model
+
+
+def refit_router(model, split, steps, lr=0.01, bs=64):
+    """Lamarckian repair for the router: the same rule as the experts'."""
+    if steps <= 0:
+        model.eval()
+        return model
+    X, y = split
+    n = X.shape[0]
+    bs = min(bs, n)
+    model.train()
+    opt = optim.Adam(model.parameters(), lr=lr)
+    crit = nn.CrossEntropyLoss()
+    for s in range(steps):
+        i = (s * bs) % max(1, n - bs + 1)
+        loss = crit(model(X[i:i + bs]), y[i:i + bs])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    model.eval()
+    return model
+
+
+def router_error(model, split):
+    X, y = split
+    model.eval()
+    with torch.no_grad():
+        return (model(X).argmax(-1) != y).float().mean().item()
+
+
+def router_score(model, split, eps):
+    """Misrouting rate is the budget; parameter count is the objective."""
+    err = router_error(model, split)
+    params = model.get_weight_count()
+    if err <= eps:
+        return (1, -float(params)), err, params
+    return (0, -err), err, params
+
+
+def evolve_router(rdata, seed, gens=_GENS, pop=_POP, allow_structure=True):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    eps = rdata["eps"]
+    train_split, val_split = rdata["train"], rdata["val"]
+
+    mother = train_router_width(train_split, BASE_DIM["router"],
+                                rdata["mother_steps"], rdata["mother_lr"],
+                                seed=seed)
+    _, m_err, m_params = router_score(mother, val_split, eps)
+    best, best_err = mother, m_err
+    _, _, best_params = router_score(best, val_split, eps)
+
+    history = []
+    for gen in range(gens):
+        feasible = best_err <= eps
+        children = [best]
+        while len(children) < pop:
+            child = mutate(best, feasible, rdata["max_dim"],
+                           allow_structure=allow_structure)
+            child = refit_router(child, train_split, rdata["refit_steps"])
+            children.append(child)
+
+        scored = []
+        for child in children:
+            s, err, params = router_score(child, val_split, eps)
+            scored.append((s, err, params, child))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        _, best_err, best_params, best = scored[0]
+        history.append({"gen": gen + 1, "dim": best.hidden_dim,
+                        "val_err": best_err, "feasible": best_err <= eps})
+
+    return {
+        "seed": seed,
+        "mother": {"dim": BASE_DIM["router"], "val_err": m_err, "params": m_params},
+        "champion": {"dim": best.hidden_dim, "val_err": best_err,
+                     "feasible": best_err <= eps, "params": best_params,
+                     "model": best},
+        "history": history,
+    }
+
+
+def sweep_router_widths(rdata, widths, reps=2):
+    """Train each router width from scratch: is the champion reproducible?"""
+    rows = []
+    for w in widths:
+        errs = []
+        for r in range(reps):
+            m = train_router_width(rdata["train"], w, rdata["mother_steps"],
+                                   rdata["mother_lr"], seed=200 + r)
+            errs.append(router_error(m, rdata["val"]))
+        rows.append({"dim": w, "val_err": mean(errs)})
+    return rows
 
 
 def routing_accuracy(router, modalities):
@@ -564,12 +701,53 @@ if __name__ == "__main__":
     print("     by shrinking from 4 units, repairing after each removal. Scale search and")
     print("     training procedure must therefore be shipped together.")
 
-    # ---------- router + assembly ----------
+    # ---------- router: width searched under a routing-error budget ----------
     print("\n" + "-" * 80)
     MODALITIES = [(0, img_data), (1, num_data), (2, mul_data)]
-    router = train_router(MODALITIES)
+    router_data = make_router_data(MODALITIES)
+    print("Router / gating: the gate's width is searched, like the experts'")
+    print(f"  mother starts at the hand-set {BASE_DIM['router']}; "
+          f"{len(SEEDS)} seeds x {_GENS} generations x {_POP} offspring; "
+          f"budget misrouting <= {router_data['eps']:.0%}")
+    print("  " + pad("Seed", 6) + pad("Mother err", 14) + pad("Feasible", 10)
+          + pad("Width", 8) + pad("Val err", 11) + pad("Params", 10))
+    print("  " + "-" * 60)
+
+    router_runs = [evolve_router(router_data, s) for s in SEEDS]
+    for r in router_runs:
+        c = r["champion"]
+        print("  " + pad(str(r["seed"]), 6)
+              + pad(f"{r['mother']['val_err']:.4f}", 14)
+              + pad("yes" if c["feasible"] else "no", 10)
+              + pad(str(c["dim"]), 8)
+              + pad(f"{c['val_err']:.4f}", 11)
+              + pad(str(c["params"]), 10))
+
+    champ_r, n_feasible_r, median_r = pick_champion(router_runs, "val_err")
+    dims_r = [r["champion"]["dim"] for r in router_runs]
+    print(f"\n  champion widths: mean {mean(dims_r):.1f} [{min(dims_r)}-{max(dims_r)}], "
+          f"feasible {n_feasible_r}/{len(router_runs)}; median {median_r} used as the scale")
+
+    ablation_r = [evolve_router(router_data, s, allow_structure=False) for s in SEEDS]
+    print(f"  ablation (same compute, structure frozen): width "
+          f"{mean([r['champion']['dim'] for r in ablation_r]):.1f}, "
+          f"val err {mean([r['champion']['val_err'] for r in ablation_r]):.4f}")
+
+    router_widths = sorted(set([1, 2, 3, 4, 8, 16, 32]
+                               + [champ_r["dim"], BASE_DIM["router"]]))
+    sweep_r = sweep_router_widths(router_data, router_widths)
+    print("\n  width sweep (each width trained from scratch twice; "
+          "* marks the evolved champion):")
+    print("    " + pad("Width", 8) + pad("Params", 10) + pad("Val err", 11))
+    print("    " + "-" * 30)
+    for row in sweep_r:
+        mark = "*" if row["dim"] == champ_r["dim"] else " "
+        print("    " + pad(mark + str(row["dim"]), 8) + pad(str(row["dim"] * 787), 10)
+              + pad(f"{row['val_err']:.4f}", 11))
+
+    router = champ_r["model"]
     acc = routing_accuracy(router, MODALITIES)
-    print("Routing accuracy (validation + test, not training): "
+    print("\nRouting accuracy (validation + test, not training): "
           + " | ".join(f"{results[k]['label']} {acc[i] * 100:.1f}%"
                        for i, k in ((1, "num"), (2, "mul"), (0, "img"))))
 
@@ -635,4 +813,7 @@ if __name__ == "__main__":
     print("     all three experts stay exactly where they started.")
     print("  6. Narrowest is not the same as trainable: the 1-unit linear solution")
     print("     is reachable only through shrink + repair, never from a random init.")
+    print(f"  7. The router is searched as well: {BASE_DIM['router']} -> {champ_r['dim']} "
+          f"units, held-out misrouting {champ_r['val_err']:.4f} "
+          f"(budget {router_data['eps']:.0%}).")
     print("=" * 80)
