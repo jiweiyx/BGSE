@@ -67,8 +67,9 @@ is equally reluctant to grow and to shrink.
 
 ## 4. Demo: Heterogeneous-Scale MoE
 
-[`HS-MoE.py`](HS-MoE.py) applies BGSE to a three-expert mixture whose experts deliberately
-**do not share a size**. Each expert gets its own budget, and each evolves its own width.
+[`HS-MoE-Demo.py`](HS-MoE-Demo.py) applies BGSE to a three-expert mixture whose experts
+deliberately **do not share a size**. Each expert gets its own budget, and each evolves its
+own width.
 
 | # | Expert | Task | Budget ε |
 |---|--------|------|----------|
@@ -130,12 +131,18 @@ go beyond 32*, not whether to trim from 32 to 19.
 git clone https://github.com/jiweiyx/BGSE
 cd BGSE
 pip install torch torchvision        # CPU is enough
-python HS-MoE.py                     # ~110 s; MNIST downloads to ./data once
+python HS-MoE-Demo.py                # ~110 s; MNIST downloads to ./data once
+python BGSE-Study.py                 # ~80 s; the five methodological experiments
 ```
 
-Output: per-seed search traces, the width sweep, a same-conditions comparison against the
-hand-set values, the from-scratch reproducibility check, router accuracy, and live dispatch
-examples for all three modalities.
+`HS-MoE-Demo.py` prints per-seed search traces, the width sweep, a same-conditions
+comparison against the hand-set values, the from-scratch reproducibility check, router
+accuracy, and live dispatch examples for all three modalities.
+
+`BGSE-Study.py` reproduces the evidence behind §3: the nine-seed control, the
+single-variable task comparison, the repair-timing ablation, and the scoreboard
+comparison. It prints one table per experiment and closes with what the data does — and
+does not — support.
 
 ```
 Requirements : Python 3.10+, PyTorch (tested on 3.14 / torch 2.14.1)
@@ -149,8 +156,8 @@ Determinism  : fixed seeds throughout; multi-seed by design
 
 | Path | Contents |
 |---|---|
-| `HS-MoE.py` | The demo in this README: three experts, three budgets, one router |
-| `12.py` | The BGSE study: 9-seed control, budget-vs-width behaviour, ablations, and the methodological checks behind rules 1–4 |
+| `HS-MoE-Demo.py` | The demo in this README: three experts, three budgets, one router |
+| `BGSE-Study.py` | The study behind the rules: nine-seed budget-vs-width control, single-variable task comparison, repair-timing ablation, and the scoreboard comparison |
 | `README.md` | This document |
 
 ---

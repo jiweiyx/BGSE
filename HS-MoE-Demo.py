@@ -39,7 +39,7 @@ returns widths in the ratio 1 : 2 : 19 (linear / multiplicative / image),
 i.e. -75%, -88% and -41% parameters, and the ordering reproduces the
 task-difficulty ordering on its own.
 
-Runtime: python3 HS-MoE.py   (CPU only, about 110 s; MNIST is downloaded once)
+Runtime: python3 HS-MoE-Demo.py   (CPU only, about 110 s; MNIST is downloaded once)
 """
 import copy
 import random
@@ -186,7 +186,7 @@ class SingleExpert(nn.Module):
         return self.layer2(torch.relu(self.layer1(x)))
 
     def get_weight_count(self):
-        """Weight-matrix elements only (biases excluded), same convention as 12.py."""
+        """Weight-matrix elements only (biases excluded), as in BGSE-Study.py."""
         return self.layer1.weight.numel() + self.layer2.weight.numel()
 
 
