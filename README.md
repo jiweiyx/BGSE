@@ -229,6 +229,71 @@ MoE literature), `genetic improvement` (an established term for automated progra
 
 ---
 
+## 10. Standard benchmarks
+
+The demo is deliberately small. [`bench/`](bench/) carries two standard-benchmark studies
+with the scripts that regenerate them; raw records, figures and generated reports are in
+`bench/results/`.
+
+**NATS-Bench, size space** — 32,768 width configurations, each with CIFAR-10 accuracy after
+90 epochs precomputed by the benchmark. Methods get 100 or 300 architecture evaluations and
+the same lexicographic objective, 30 seeds each: BGSE, REA, REA + gate, TPE, REINFORCE and
+random search.
+
+| method | τ = 92, 300 evals | τ = 93, 300 evals |
+|---|---|---|
+| TPE | **0.2227 M** | 0.4311 M |
+| REA + gate | 0.2300 M | 0.4294 M |
+| REA | 0.2353 M | **0.4286 M** |
+| Random | 0.2503 M | 0.4578 M |
+| BGSE (1+λ) | 0.2903 M | 0.4682 M |
+
+Median parameters of the cheapest feasible architecture (lower is better; τ is the accuracy
+floor). On this table **the gate helps a little and the elitist loop hurts**: BGSE's
+`(1+λ)` stalls at the first feasibility boundary it reaches, while the same gate inside REA
+beats plain REA by about 2–3 % at τ = 92 and ties it at τ = 93. TPE wins overall. Accuracy here
+is a table lookup, so there is no repair step — this measures the search rule alone.
+
+**CIFAR-10, end to end** — a 6-layer CNN with per-layer widths in `{8, 16, 32, 64}`, 10k
+training images, two accuracy budgets and 5 seeds; the comparison is plotted against training
+epochs actually spent, so a warm-started repair is charged what it costs.
+
+| method | ε = 0.62 width | ε = 0.68 width | feasible at 0.68 |
+|---|---|---|---|
+| BGSE (repair + gate) | 120 [88–136] | 192 [176–256] | 5/5 |
+| Static-mutation EA (repair) | **104 [96–120]** | 192 [176–256] | 5/5 |
+| Random search | 192 [136–256] | 288 (one seed) | 1/5 |
+| BGSE-NoRepair | 192 [192–192] | – | **0/5** |
+
+Sum of the six layer widths, median over five seeds. **Repair is the load-bearing step**:
+without it the strict budget is never met (0/5) and the loose one never shrinks below the
+mother. The budget gate is not what carries the method — static mutation with repair ties
+BGSE. Table with test accuracy and the figure:
+[`bench/results/cifar_report.md`](bench/results/cifar_report.md).
+
+### Why the single-lineage loop is the right default end to end
+
+The two tables above are honest about where the search rule loses: when an architecture
+evaluation is free (a lookup table), a population (REA) and a model-based sampler (TPE) beat
+the `(1+λ)` loop. End-to-end training is the opposite regime, and there the trade-off flips:
+
+- **One model resident instead of N.** A population has to keep every individual alive and,
+  with repair, fine-tune each of them; `(1+λ)` keeps the incumbent plus one child. On a
+  single GPU or a laptop that difference is the whole memory budget.
+- **The epoch budget goes to the incumbent.** A population either spends `N × 8` epochs
+  before it can make its first comparison, or gives each individual a fraction of the
+  training. `(1+λ)` spends the budget on the model it is about to ship.
+- **Repair removes the need for a population.** A population helps because a shrunken child
+  usually scores worse; a few warm-start steps fix that directly, so the search does not need
+  many lineages to recover a good region.
+
+So the end-to-end claim is deliberately modest: `(1+λ)` plus repair is **enough** to meet the
+budget, with one model in memory and no population bookkeeping. It is a cost argument rather
+than a head-to-head against REA at equal epochs; the measured support is the repair ablation
+above, which is where the method's value actually shows.
+
+---
+
 ## Author
 
 **Jiwei Li** — jiweiyx@gmail.com — https://github.com/jiweiyx/BGSE
